@@ -1,134 +1,118 @@
 const WebSocket = require('ws');
-const clientManager = require('./client-manager');
 const syncManager = require('./sync-manager');
-const db = require('./db/database');
+const clientManager = require('./client-manager');
 
-function setupWebSocket(server) {
-  const wss = new WebSocket.Server({ server });
+class WebSocketHandler {
+  constructor(server) {
+    this.wss = new WebSocket.Server({ server });
+    this.setupWebSocket();
+  }
 
-  // Start cleanup processes
-  clientManager.startCleanup();
-  syncManager.startCleanup();
+  setupWebSocket() {
+    this.wss.on('connection', (ws, req) => {
+      const clientId = Date.now().toString();
+      const clientIp = req.socket.remoteAddress;
 
-  wss.on('connection', (ws, req) => {
-    const ip = req.socket.remoteAddress;
-    const client = clientManager.addClient(ws, ip);
-    console.log(`Client connected from ${ip} with ID ${client.id}`);
+      // Register new client
+      clientManager.addClient(clientId, clientIp);
+      
+      console.log(`Client connected: ${clientId} from ${clientIp}`);
 
-    // Send initial data to the new client
-    ws.send(JSON.stringify({
-      type: 'INIT_DATA',
-      ...syncManager.getFullSnapshot()
-    }));
-
-    // Send any pending changes since last sync
-    const pendingChanges = syncManager.getChangesSinceLastSync(client.id);
-    if (pendingChanges.length > 0) {
+      // Send initial data
       ws.send(JSON.stringify({
-        type: 'PENDING_CHANGES',
-        changes: pendingChanges
+        type: 'INIT_DATA',
+        ...syncManager.getFullSnapshot()
       }));
-    }
 
-    // Broadcast client list to all connected clients
-    clientManager.broadcast({
-      type: 'CLIENTS_UPDATE',
-      clients: clientManager.getClients()
-    });
+      // Broadcast client connection to others
+      this.broadcastClientUpdate(clientId, 'connected');
 
-    ws.on('message', (message) => {
-      try {
-        const data = JSON.parse(message);
-
-        switch (data.type) {
-          case 'HEARTBEAT':
-            clientManager.updateClientLastSeen(client.id);
-            break;
-
-          case 'GET_CLIENTS':
-            ws.send(JSON.stringify({
-              type: 'CLIENTS_UPDATE',
-              clients: clientManager.getClients()
-            }));
-            break;
-
-          case 'GET_LOCAL_IP':
-            ws.send(JSON.stringify({
-              type: 'LOCAL_IP',
-              ip: ip
-            }));
-            break;
-
-          case 'SYNC_REQUEST':
-            const syncResponse = syncManager.handleDataSync(client.id, data);
-            if (syncResponse) {
-              if (syncResponse.type === 'SYNC_SUCCESS') {
-                // Broadcast changes to all clients except sender
-                clientManager.broadcast(syncResponse.payload, client.id);
+      ws.on('message', async (message) => {
+        try {
+          const data = JSON.parse(message);
+          
+          // Handle sync requests
+          if (data.type === 'SYNC_REQUEST') {
+            const response = await syncManager.handleDataSync(clientId, data);
+            if (response) {
+              ws.send(JSON.stringify(response));
+              
+              // If the sync was successful and resulted in changes, broadcast to other clients
+              if (response.type === 'SYNC_SUCCESS') {
+                this.broadcastToOthers(ws, response);
               }
-              // Send response to the requesting client
-              ws.send(JSON.stringify(syncResponse));
             }
-            break;
-
-          case 'VERIFY_SYNC':
-            const clientVersion = data.version;
-            const currentVersion = syncManager.getCurrentVersion();
-            
-            if (clientVersion < currentVersion) {
-              // Client is out of sync, send full data
+          }
+          
+          // Handle version verification
+          else if (data.type === 'VERIFY_SYNC') {
+            const changes = syncManager.getChangesSinceLastSync(clientId);
+            if (changes.length > 0) {
               ws.send(JSON.stringify({
-                type: 'FULL_SYNC',
-                ...syncManager.getFullSnapshot()
+                type: 'PENDING_CHANGES',
+                changes,
+                currentVersion: syncManager.getCurrentVersion()
               }));
             }
-            break;
+          }
 
-          default:
-            console.warn('Unknown message type:', data.type);
+        } catch (error) {
+          console.error('Error processing message:', error);
+          ws.send(JSON.stringify({
+            type: 'ERROR',
+            error: 'Failed to process message',
+            details: error.message
+          }));
         }
-      } catch (error) {
-        console.error('Error processing message:', error);
-        ws.send(JSON.stringify({
-          type: 'ERROR',
-          error: 'Failed to process message',
-          details: error.message
-        }));
+      });
+
+      ws.on('close', () => {
+        console.log(`Client disconnected: ${clientId}`);
+        clientManager.removeClient(clientId);
+        this.broadcastClientUpdate(clientId, 'disconnected');
+        
+        // Release any locks held by this client
+        syncManager.cleanup();
+      });
+
+      // Handle errors
+      ws.on('error', (error) => {
+        console.error(`WebSocket error for client ${clientId}:`, error);
+        clientManager.removeClient(clientId);
+      });
+    });
+  }
+
+  broadcastToOthers(excludeWs, data) {
+    this.wss.clients.forEach(client => {
+      if (client !== excludeWs && client.readyState === WebSocket.OPEN) {
+        client.send(JSON.stringify(data));
       }
     });
+  }
 
-    ws.on('close', () => {
-      console.log(`Client ${client.id} disconnected`);
-      clientManager.removeClient(client.id);
-      
-      // Broadcast updated client list
-      clientManager.broadcast({
-        type: 'CLIENTS_UPDATE',
-        clients: clientManager.getClients()
-      });
+  broadcastClientUpdate(clientId, status) {
+    const clients = clientManager.getClients();
+    const message = {
+      type: status === 'connected' ? 'CLIENT_CONNECTED' : 'CLIENT_DISCONNECTED',
+      clientId,
+      clients
+    };
+
+    this.wss.clients.forEach(client => {
+      if (client.readyState === WebSocket.OPEN) {
+        client.send(JSON.stringify(message));
+      }
     });
+  }
 
-    ws.on('error', (error) => {
-      console.error(`WebSocket error for client ${client.id}:`, error);
-      clientManager.removeClient(client.id);
+  broadcastToAll(data) {
+    this.wss.clients.forEach(client => {
+      if (client.readyState === WebSocket.OPEN) {
+        client.send(JSON.stringify(data));
+      }
     });
-  });
-
-  // Periodic status broadcast
-  setInterval(() => {
-    if (wss.clients.size > 0) {
-      clientManager.broadcast({
-        type: 'CLIENTS_UPDATE',
-        clients: clientManager.getClients()
-      });
-    }
-  }, 10000); // Every 10 seconds
-
-  return {
-    broadcast: (message) => clientManager.broadcast(message),
-    getClients: () => clientManager.getClients(),
-    getActiveClients: () => clientManager.getActiveClients()
-  };
+  }
 }
 
-module.exports = setupWebSocket;
+module.exports = WebSocketHandler;

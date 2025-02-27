@@ -5,175 +5,269 @@ class SyncManager {
     this.version = Date.now();
     this.pendingChanges = new Map();
     this.lastSyncTime = new Map();
+    this.locks = new Map(); // Add locks for preventing concurrent modifications
+    this.clientVersions = new Map(); // Track client versions
+    this.startCleanup();
   }
 
-  // Generate a new version number
+  // Lock mechanism to prevent concurrent modifications
+  async acquireLock(resourceId, clientId, timeout = 5000) {
+    const lockKey = `${resourceId}`;
+    const startTime = Date.now();
+
+    while (Date.now() - startTime < timeout) {
+      const currentLock = this.locks.get(lockKey);
+      if (!currentLock || currentLock.clientId === clientId) {
+        this.locks.set(lockKey, { clientId, timestamp: Date.now() });
+        return true;
+      }
+      // Wait for 100ms before trying again
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+    return false;
+  }
+
+  releaseLock(resourceId, clientId) {
+    const lockKey = `${resourceId}`;
+    const currentLock = this.locks.get(lockKey);
+    if (currentLock && currentLock.clientId === clientId) {
+      this.locks.delete(lockKey);
+    }
+  }
+
+  // Improved version management
   generateVersion() {
-    return Date.now();
+    return Date.now() * 1000 + Math.floor(Math.random() * 1000);
   }
 
-  // Handle incoming data changes
-  handleDataSync(clientId, data) {
+  async handleDataSync(clientId, data) {
     const { type, payload, clientVersion } = data;
-    const currentVersion = this.version;
+    
+    // Update client's last known version
+    this.clientVersions.set(clientId, clientVersion);
 
-    // If client version is older, send full data update
-    if (clientVersion < currentVersion) {
+    // Check if client needs full sync
+    if (this.needsFullSync(clientId, clientVersion)) {
       return {
         type: 'FULL_SYNC',
-        payload: {
-          cashiers: db.getCashiers(),
-          reports: db.getAllReports(),
-          version: currentVersion
-        }
+        payload: this.getFullSnapshot()
       };
     }
 
-    // Process changes based on type
+    // Get any pending changes the client might have missed
+    const pendingChanges = this.getChangesSinceLastSync(clientId);
+    if (pendingChanges.length > 0) {
+      return {
+        type: 'PENDING_CHANGES',
+        changes: pendingChanges,
+        currentVersion: this.version
+      };
+    }
+
+    // Process new changes
     switch (type) {
       case 'CASHIER_UPDATE':
-        return this.handleCashierUpdate(clientId, payload, currentVersion);
+        return await this.handleCashierUpdate(clientId, payload);
       case 'REPORT_UPDATE':
-        return this.handleReportUpdate(clientId, payload, currentVersion);
+        return await this.handleReportUpdate(clientId, payload);
       default:
         return null;
     }
   }
 
-  handleCashierUpdate(clientId, payload, currentVersion) {
+  async handleCashierUpdate(clientId, payload) {
     const { cashier, action } = payload;
-    let response = null;
+
+    // Try to acquire lock
+    const lockAcquired = await this.acquireLock(cashier.id, clientId);
+    if (!lockAcquired) {
+      return {
+        type: 'SYNC_ERROR',
+        payload: {
+          error: 'Resource is locked by another client',
+          code: 'RESOURCE_LOCKED'
+        }
+      };
+    }
 
     try {
+      // Verify no conflicting changes
+      const currentData = db.getCashiers().find(c => c.id === cashier.id);
+      if (currentData && currentData.version > payload.baseVersion) {
+        return {
+          type: 'SYNC_CONFLICT',
+          payload: {
+            currentData,
+            conflictingChanges: this.getConflictingChanges(cashier.id)
+          }
+        };
+      }
+
+      // Process the update
+      const newVersion = this.generateVersion();
       switch (action) {
         case 'ADD':
         case 'UPDATE':
-          db.updateCashier(cashier);
+          db.updateCashier({ ...cashier, version: newVersion });
           break;
         case 'DELETE':
           db.deleteCashier(cashier.id);
           break;
       }
 
-      // Generate new version
-      this.version = this.generateVersion();
-
-      response = {
-        type: 'SYNC_SUCCESS',
-        payload: {
-          type: 'CASHIERS_UPDATE',
-          cashiers: db.getCashiers(),
-          version: this.version
-        }
-      };
-
-      // Store change in pending changes
-      this.pendingChanges.set(this.version, {
+      this.version = newVersion;
+      
+      // Store the change
+      this.pendingChanges.set(newVersion, {
         type: 'CASHIER_UPDATE',
         action,
         data: cashier,
         timestamp: new Date(),
-        clientId
+        clientId,
+        version: newVersion
       });
+
+      return {
+        type: 'SYNC_SUCCESS',
+        payload: {
+          type: 'CASHIERS_UPDATE',
+          cashiers: db.getCashiers(),
+          version: newVersion
+        }
+      };
 
     } catch (error) {
       console.error('Error handling cashier update:', error);
-      response = {
+      return {
         type: 'SYNC_ERROR',
         payload: {
           error: 'Failed to update cashier data',
           details: error.message
         }
       };
+    } finally {
+      this.releaseLock(cashier.id, clientId);
     }
-
-    return response;
   }
 
-  handleReportUpdate(clientId, payload, currentVersion) {
+  async handleReportUpdate(clientId, payload) {
     const { report, action } = payload;
-    let response = null;
+    const lockKey = `report_${report.date}`;
+    
+    const lockAcquired = await this.acquireLock(lockKey, clientId);
+    if (!lockAcquired) {
+      return {
+        type: 'SYNC_ERROR',
+        payload: {
+          error: 'Report is being modified by another client',
+          code: 'RESOURCE_LOCKED'
+        }
+      };
+    }
 
     try {
+      const newVersion = this.generateVersion();
       switch (action) {
         case 'ADD':
-          db.saveReport(report);
-          break;
         case 'UPDATE':
-          db.updateReport(report);
+          db.saveReport({ ...report, version: newVersion });
           break;
         case 'DELETE':
           db.deleteReport(report.date);
           break;
       }
 
-      // Generate new version
-      this.version = this.generateVersion();
-
-      response = {
-        type: 'SYNC_SUCCESS',
-        payload: {
-          type: 'REPORTS_UPDATE',
-          reports: db.getAllReports(),
-          version: this.version
-        }
-      };
-
-      // Store change in pending changes
-      this.pendingChanges.set(this.version, {
+      this.version = newVersion;
+      
+      this.pendingChanges.set(newVersion, {
         type: 'REPORT_UPDATE',
         action,
         data: report,
         timestamp: new Date(),
-        clientId
+        clientId,
+        version: newVersion
       });
+
+      return {
+        type: 'SYNC_SUCCESS',
+        payload: {
+          type: 'REPORTS_UPDATE',
+          reports: db.getAllReports(),
+          version: newVersion
+        }
+      };
 
     } catch (error) {
       console.error('Error handling report update:', error);
-      response = {
+      return {
         type: 'SYNC_ERROR',
         payload: {
           error: 'Failed to update report data',
           details: error.message
         }
       };
+    } finally {
+      this.releaseLock(lockKey, clientId);
     }
-
-    return response;
   }
 
-  // Get changes since last sync for a client
+  needsFullSync(clientId, clientVersion) {
+    // Client needs full sync if:
+    // 1. No version information
+    // 2. Client version is too old (more than 1 hour behind)
+    // 3. Client version is ahead of server (clock skew)
+    if (!clientVersion) return true;
+    
+    const hourAgo = Date.now() - (60 * 60 * 1000);
+    return clientVersion < hourAgo || clientVersion > this.version;
+  }
+
+  getConflictingChanges(resourceId) {
+    return Array.from(this.pendingChanges.values())
+      .filter(change => 
+        change.data.id === resourceId || 
+        (change.type === 'REPORT_UPDATE' && change.data.date === resourceId)
+      )
+      .sort((a, b) => b.timestamp - a.timestamp);
+  }
+
   getChangesSinceLastSync(clientId) {
     const lastSync = this.lastSyncTime.get(clientId) || 0;
     const changes = Array.from(this.pendingChanges.entries())
-      .filter(([version, change]) => version > lastSync && change.clientId !== clientId)
+      .filter(([version, change]) => 
+        version > lastSync && 
+        change.clientId !== clientId &&
+        change.timestamp > Date.now() - (60 * 60 * 1000) // Only changes from last hour
+      )
       .map(([_, change]) => change);
 
     this.lastSyncTime.set(clientId, this.version);
     return changes;
   }
 
-  // Clean up old pending changes (older than 1 hour)
   cleanup() {
-    const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000);
+    const hourAgo = new Date(Date.now() - (60 * 60 * 1000));
+    
+    // Clean up pending changes
     for (const [version, change] of this.pendingChanges.entries()) {
-      if (change.timestamp < oneHourAgo) {
+      if (change.timestamp < hourAgo) {
         this.pendingChanges.delete(version);
+      }
+    }
+
+    // Clean up stale locks (older than 5 minutes)
+    const fiveMinutesAgo = Date.now() - (5 * 60 * 1000);
+    for (const [key, lock] of this.locks.entries()) {
+      if (lock.timestamp < fiveMinutesAgo) {
+        this.locks.delete(key);
       }
     }
   }
 
-  // Start periodic cleanup
   startCleanup() {
-    setInterval(() => this.cleanup(), 15 * 60 * 1000); // Clean up every 15 minutes
+    setInterval(() => this.cleanup(), 5 * 60 * 1000); // Clean up every 5 minutes
   }
 
-  // Get current version
-  getCurrentVersion() {
-    return this.version;
-  }
-
-  // Get full data snapshot
   getFullSnapshot() {
     return {
       cashiers: db.getCashiers(),

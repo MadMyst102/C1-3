@@ -17,25 +17,14 @@ class WebSocketService {
   private connectionHandlers: Set<ConnectionHandler> = new Set();
   private disconnectionHandlers: Set<ConnectionHandler> = new Set();
   private clients: Map<string, Client> = new Map();
-  private clientUpdateInterval: NodeJS.Timeout | null = null;
   private currentVersion: number = 0;
   private syncInterval: NodeJS.Timeout | null = null;
+  private pendingOperations: Map<string, { resolve: Function, reject: Function }> = new Map();
+  private operationTimeout = 30000; // 30 seconds timeout for operations
 
   constructor(private url: string = `ws://${window.location.hostname}:3000`) {
     this.connect();
     this.startSyncVerification();
-  }
-
-  private startSyncVerification() {
-    // Verify sync status every 30 seconds
-    this.syncInterval = setInterval(() => {
-      if (this.isConnected()) {
-        this.send({
-          type: 'VERIFY_SYNC',
-          version: this.currentVersion
-        });
-      }
-    }, 30000);
   }
 
   private connect() {
@@ -52,7 +41,6 @@ class WebSocketService {
       this.ws.onclose = () => {
         console.log('WebSocket disconnected');
         this.disconnectionHandlers.forEach(handler => handler());
-        this.stopClientTracking();
         this.attemptReconnect();
       };
 
@@ -64,24 +52,33 @@ class WebSocketService {
         try {
           const data = JSON.parse(event.data);
           
-          // Handle sync-related messages
-          if (data.type === 'INIT_DATA') {
-            this.currentVersion = data.version;
-          } else if (data.type === 'SYNC_SUCCESS') {
-            this.currentVersion = data.payload.version;
-          } else if (data.type === 'FULL_SYNC') {
-            this.currentVersion = data.version;
-          } else if (data.type === 'PENDING_CHANGES') {
-            this.applyPendingChanges(data.changes);
-          }
+          switch (data.type) {
+            case 'INIT_DATA':
+              this.currentVersion = data.version;
+              break;
 
-          // Handle client updates
-          if (data.type === 'CLIENT_CONNECTED') {
-            this.updateClient(data.client);
-          } else if (data.type === 'CLIENT_DISCONNECTED') {
-            this.removeClient(data.clientId);
-          } else if (data.type === 'CLIENTS_LIST') {
-            this.updateClientsList(data.clients);
+            case 'SYNC_SUCCESS':
+              this.currentVersion = data.payload.version;
+              this.resolvePendingOperation(data.payload.type, data);
+              break;
+
+            case 'SYNC_ERROR':
+              this.rejectPendingOperation(data.payload.error, data);
+              break;
+
+            case 'SYNC_CONFLICT':
+              this.handleConflict(data.payload);
+              break;
+
+            case 'PENDING_CHANGES':
+              this.applyPendingChanges(data.changes);
+              this.currentVersion = data.currentVersion;
+              break;
+
+            case 'CLIENT_CONNECTED':
+            case 'CLIENT_DISCONNECTED':
+              this.updateClientsList(data.clients);
+              break;
           }
           
           this.messageHandlers.forEach(handler => handler(data));
@@ -95,9 +92,22 @@ class WebSocketService {
     }
   }
 
+  private async handleConflict(payload: any) {
+    const { currentData, conflictingChanges } = payload;
+    console.warn('Sync conflict detected:', { currentData, conflictingChanges });
+    
+    // Notify handlers of conflict
+    this.messageHandlers.forEach(handler => handler({
+      type: 'SYNC_CONFLICT',
+      payload: {
+        currentData,
+        conflictingChanges
+      }
+    }));
+  }
+
   private applyPendingChanges(changes: any[]) {
     changes.forEach(change => {
-      // Notify handlers of each change
       this.messageHandlers.forEach(handler => handler({
         type: change.type === 'CASHIER_UPDATE' ? 'CASHIERS_UPDATE' : 'REPORTS_UPDATE',
         payload: change.data
@@ -120,7 +130,40 @@ class WebSocketService {
     }, this.reconnectDelay);
   }
 
-  public send(data: any) {
+  private createOperationPromise(type: string): Promise<any> {
+    return new Promise((resolve, reject) => {
+      const operationId = `${type}_${Date.now()}`;
+      this.pendingOperations.set(operationId, { resolve, reject });
+
+      // Set timeout
+      setTimeout(() => {
+        if (this.pendingOperations.has(operationId)) {
+          this.pendingOperations.delete(operationId);
+          reject(new Error('Operation timed out'));
+        }
+      }, this.operationTimeout);
+    });
+  }
+
+  private resolvePendingOperation(type: string, data: any) {
+    const operationId = Array.from(this.pendingOperations.keys())
+      .find(key => key.startsWith(type));
+    
+    if (operationId) {
+      const { resolve } = this.pendingOperations.get(operationId)!;
+      this.pendingOperations.delete(operationId);
+      resolve(data);
+    }
+  }
+
+  private rejectPendingOperation(error: string, data: any) {
+    this.pendingOperations.forEach(({ reject }, key) => {
+      this.pendingOperations.delete(key);
+      reject({ error, details: data });
+    });
+  }
+
+  public async send(data: any): Promise<any> {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
       throw new Error('WebSocket is not connected');
     }
@@ -131,7 +174,9 @@ class WebSocketService {
         data.clientVersion = this.currentVersion;
       }
       
+      const promise = this.createOperationPromise(data.type);
       this.ws.send(JSON.stringify(data));
+      return promise;
     } catch (error) {
       console.error('Error sending WebSocket message:', error);
       throw error;
@@ -151,6 +196,20 @@ class WebSocketService {
   public onDisconnect(handler: ConnectionHandler) {
     this.disconnectionHandlers.add(handler);
     return () => this.disconnectionHandlers.delete(handler);
+  }
+
+  private startSyncVerification() {
+    // Verify sync status every 30 seconds
+    this.syncInterval = setInterval(() => {
+      if (this.isConnected()) {
+        this.send({
+          type: 'VERIFY_SYNC',
+          version: this.currentVersion
+        }).catch(error => {
+          console.error('Error verifying sync status:', error);
+        });
+      }
+    }, 30000);
   }
 
   public isConnected(): boolean {
@@ -178,17 +237,6 @@ class WebSocketService {
     return Array.from(this.clients.values());
   }
 
-  private updateClient(client: Client) {
-    this.clients.set(client.id, {
-      ...client,
-      lastSeen: new Date()
-    });
-  }
-
-  private removeClient(clientId: string) {
-    this.clients.delete(clientId);
-  }
-
   private updateClientsList(clients: Client[]) {
     this.clients.clear();
     clients.forEach(client => {
@@ -199,15 +247,7 @@ class WebSocketService {
     });
   }
 
-  private stopClientTracking() {
-    if (this.clientUpdateInterval) {
-      clearInterval(this.clientUpdateInterval);
-      this.clientUpdateInterval = null;
-    }
-  }
-
   public disconnect() {
-    this.stopClientTracking();
     if (this.syncInterval) {
       clearInterval(this.syncInterval);
       this.syncInterval = null;

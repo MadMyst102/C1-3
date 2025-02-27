@@ -1,8 +1,9 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useMemo } from 'react';
 import { ReportModal } from './components/ReportModal';
 import { Clock } from './components/Clock';
 import { NetworkStatus } from './components/NetworkStatus';
-import { FileDown, FileUp, Calendar, Users, FileText } from 'lucide-react';
+import { FileDown, FileUp, Calendar, Users, FileText, BarChart } from 'lucide-react';
+import { Statistics } from './components/Statistics';
 import { format } from 'date-fns';
 import { ar } from 'date-fns/locale';
 import { DayPicker } from 'react-day-picker';
@@ -33,10 +34,25 @@ function AppContent() {
   const [showCalendar, setShowCalendar] = useState(false);
   const [selectedDate, setSelectedDate] = useState<Date | undefined>(new Date());
   const [connectionStatus, setConnectionStatus] = useState<'connected' | 'connecting' | 'disconnected'>('connecting');
+  const [searchQuery, setSearchQuery] = useState('');
+  const [filterStatus, setFilterStatus] = useState<'all' | 'active' | 'inactive'>('all');
   const [cashiers, setCashiers] = useState<Cashier[]>(() => {
     const savedCashiers = localStorage.getItem(STORAGE_KEYS.CASHIERS);
     return savedCashiers ? JSON.parse(savedCashiers) : [];
   });
+
+  // Filter cashiers based on search query and status
+  const filteredCashiers = useMemo(() => {
+    return cashiers.filter(cashier => {
+      const matchesSearch = cashier.name.toLowerCase().includes(searchQuery.toLowerCase());
+      const hasDeliveries = cashier.deliveries.length > 0;
+      
+      if (filterStatus === 'active' && !hasDeliveries) return false;
+      if (filterStatus === 'inactive' && hasDeliveries) return false;
+      
+      return matchesSearch;
+    });
+  }, [cashiers, searchQuery, filterStatus]);
 
   const { showNotification } = useNotification();
   const { confirm, ConfirmDialog } = useConfirmDialog();
@@ -290,7 +306,8 @@ function AppContent() {
       <NetworkStatus />
       <ConnectionStatus status={connectionStatus} />
       
-      <div className="container mx-auto px-4 py-8">
+      <div className="container mx-auto px-4 py-8 space-y-6">
+        <Statistics cashiers={cashiers} />
         <div className="mb-4 flex justify-between items-center">
           <div className="flex gap-2 items-center">
             <button
@@ -357,9 +374,38 @@ function AppContent() {
           </div>
         </div>
 
+        {/* Search and Filter Controls */}
+        <div className="bg-white rounded-lg shadow p-4 mb-6">
+          <div className="flex gap-4 items-center">
+            <div className="flex-1">
+              <input
+                type="text"
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                placeholder="بحث عن موظف..."
+                className="w-full p-2 border rounded-md"
+              />
+            </div>
+            <select
+              value={filterStatus}
+              onChange={(e) => setFilterStatus(e.target.value as 'all' | 'active' | 'inactive')}
+              className="p-2 border rounded-md bg-white"
+            >
+              <option value="all">جميع الموظفين</option>
+              <option value="active">النشطين</option>
+              <option value="inactive">غير النشطين</option>
+            </select>
+          </div>
+        </div>
+
         {/* قائمة الموظفين */}
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-          {cashiers.map((cashier) => (
+          {filteredCashiers.length === 0 ? (
+            <div className="col-span-full text-center py-8 text-gray-500">
+              لا يوجد موظفين مطابقين للبحث
+            </div>
+          ) : (
+            filteredCashiers.map((cashier) => (
             <CashierCard
               key={cashier.id}
               cashier={cashier}
@@ -392,7 +438,8 @@ function AppContent() {
                 updateCashiersState(newCashiers);
               }}
             />
-          ))}
+            ))
+          )}
         </div>
 
         {/* زر توليد التقرير */}
