@@ -2,8 +2,7 @@ import { useState, useEffect, useCallback, useMemo } from 'react';
 import { ReportModal } from './components/ReportModal';
 import { Clock } from './components/Clock';
 import { NetworkStatus } from './components/NetworkStatus';
-import { FileDown, FileUp, Calendar, Users, FileText, BarChart } from 'lucide-react';
-import { Statistics } from './components/Statistics';
+import { FileDown, FileUp, Calendar, Users, FileText } from 'lucide-react';
 import { format } from 'date-fns';
 import { ar } from 'date-fns/locale';
 import { DayPicker } from 'react-day-picker';
@@ -11,13 +10,13 @@ import 'react-day-picker/dist/style.css';
 
 import wsService from './services/websocket-service';
 import { CashierCard } from './components/CashierCard';
-import { LoadingSpinner, ConnectionStatus, LoadingOverlay } from './components/LoadingSpinner';
+import { ConnectionStatus, LoadingOverlay } from './components/LoadingSpinner';
 import { NotificationProvider, useNotification } from './components/Notification';
 import { useConfirmDialog } from './components/ConfirmDialog';
 import { validateCashier, calculateExpectedAmount } from './utils/validation';
-import { createBackup, restoreBackup } from './utils/backup';
+import { createBackup } from './utils/backup';
 import { exportData, importData } from './utils/dataTransfer';
-import type { Cashier, CashierReport, DailyReport, Delivery } from './types';
+import type { Cashier, CashierReport, DailyReport } from './types';
 
 // Local storage keys
 const STORAGE_KEYS = {
