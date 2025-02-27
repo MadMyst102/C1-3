@@ -1,0 +1,18 @@
+version: '3.8'
+
+services:
+  app:
+    build: .
+    ports:
+      - "3000:3000"  # WebSocket server
+      - "5173:5173"  # React development server
+    environment:
+      - NODE_ENV=production
+    volumes:
+      - ./data:/app/data  # For persistent data storage
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "http://localhost:3000"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
