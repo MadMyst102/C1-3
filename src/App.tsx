@@ -215,42 +215,79 @@ function AppContent() {
   };
 
   const startNewDay = async () => {
-    const confirmed = await confirm({
-      type: 'warning',
-      title: 'تأكيد بدء يوم جديد',
-      message: 'هل أنت متأكد من بدء يوم جديد؟ سيتم حفظ بيانات اليوم الحالي في التقارير.'
-    });
+    try {
+      const confirmed = await confirm({
+        type: 'warning',
+        title: 'تأكيد بدء يوم جديد',
+        message: 'هل أنت متأكد من بدء يوم جديد؟ سيتم حفظ بيانات اليوم الحالي في التقارير.'
+      });
 
-    if (!confirmed) return;
+      if (!confirmed) return;
 
-    // Save current data as a report first
-    generateReport();
-    
-    // Create backup
-    if (createBackup()) {
-      showNotification('info', 'تم إنشاء نسخة احتياطية من بيانات اليوم السابق');
+      setLoading(true);
+
+      // Generate and save the current day's report
+      const report = generateDailyReport(false); // Pass false to prevent showing the report modal
+      if (!report) return;
+
+      // Save the report to the database
+      const dailyReport: DailyReport = {
+        date: format(new Date(), 'yyyy-MM-dd'),
+        reports: report
+      };
+
+      const savedReports = localStorage.getItem(STORAGE_KEYS.DAILY_REPORTS);
+      let reports: DailyReport[] = savedReports ? JSON.parse(savedReports) : [];
+      
+      const existingReportIndex = reports.findIndex(r => r.date === dailyReport.date);
+      if (existingReportIndex !== -1) {
+        reports[existingReportIndex] = dailyReport;
+      } else {
+        reports.push(dailyReport);
+      }
+      
+      localStorage.setItem(STORAGE_KEYS.DAILY_REPORTS, JSON.stringify(reports));
+      wsService.send({
+        type: 'REPORTS_UPDATE',
+        reports
+      });
+      
+      // Create backup of current data
+      if (createBackup()) {
+        showNotification('info', 'تم إنشاء نسخة احتياطية من بيانات اليوم السابق');
+      }
+
+      // Wait for the report to be synced with the server
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      
+      // Reset cashiers' daily data but keep their names
+      const newCashiers = cashiers.map(cashier => ({
+        ...cashier,
+        expectedAmount: 0,
+        cashSales: 0,
+        returnSales: 0,
+        deliveries: []
+      }));
+      
+      // Update state and sync with server
+      await updateCashiersState(newCashiers);
+      
+      showNotification('success', 'تم بدء يوم جديد بنجاح');
+    } catch (error) {
+      console.error('Error starting new day:', error);
+      showNotification('error', 'حدث خطأ أثناء بدء يوم جديد');
+    } finally {
+      setLoading(false);
     }
-    
-    // Reset cashiers' daily data but keep their names
-    const newCashiers = cashiers.map(cashier => ({
-      ...cashier,
-      expectedAmount: 0,
-      cashSales: 0,
-      returnSales: 0,
-      deliveries: []
-    }));
-    
-    updateCashiersState(newCashiers);
-    showNotification('success', 'تم بدء يوم جديد بنجاح');
   };
 
-  const generateReport = () => {
+  const generateDailyReport = (showModal = true): CashierReport[] | undefined => {
     if (cashiers.length === 0) {
       showNotification('error', 'لا يوجد موظفين لإنشاء التقرير');
-      return;
+      return undefined;
     }
 
-    const report = cashiers.map((cashier) => {
+    const report: CashierReport[] = cashiers.map((cashier) => {
       const totalDelivered = cashier.deliveries.reduce(
         (sum, delivery) => sum + delivery.amount,
         0
@@ -295,19 +332,24 @@ function AppContent() {
       reports
     });
 
-    setCurrentReport(report);
-    setShowReport(true);
+    if (showModal) {
+      setCurrentReport(report);
+      setShowReport(true);
+    }
     showNotification('success', 'تم إنشاء التقرير بنجاح');
+    return report;
   };
 
   return (
     <div className="min-h-screen bg-gray-50 text-right" dir="rtl">
-      <Clock />
-      <NetworkStatus />
-      <ConnectionStatus status={connectionStatus} />
-      
       <div className="container mx-auto px-4 py-8 space-y-6">
-        <Statistics cashiers={cashiers} />
+        <div className="flex justify-between items-center">
+          <Clock />
+          <div className="flex items-center gap-4">
+            <NetworkStatus />
+            <ConnectionStatus status={connectionStatus} />
+          </div>
+        </div>
         <div className="mb-4 flex justify-between items-center">
           <div className="flex gap-2 items-center">
             <button
@@ -445,7 +487,7 @@ function AppContent() {
         {/* زر توليد التقرير */}
         <div className="mt-8 flex justify-end">
           <button
-            onClick={generateReport}
+            onClick={() => generateDailyReport(true)}
             className="bg-indigo-600 text-white px-6 py-3 rounded-md hover:bg-indigo-700 flex items-center gap-2"
           >
             <FileText size={20} />
