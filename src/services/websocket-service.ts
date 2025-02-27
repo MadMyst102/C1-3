@@ -19,90 +19,107 @@ class WebSocketService {
   private clients: Map<string, Client> = new Map();
   private currentVersion: number = 0;
   private syncInterval: NodeJS.Timeout | null = null;
-  private pendingOperations: Map<string, { resolve: Function, reject: Function }> = new Map();
-  private operationTimeout = 30000; // 30 seconds timeout for operations
+  private pendingOperations: Map<string, { resolve: Function, reject: Function, timeout: NodeJS.Timeout }> = new Map();
+  private operationTimeout = 5000; // Reduced to 5 seconds
+  private isReconnecting = false;
 
   constructor(private url: string = `ws://${window.location.hostname}:3000`) {
     this.connect();
-    this.startSyncVerification();
   }
 
-  private connect() {
+  private async connect() {
+    if (this.isReconnecting) return;
+    
     try {
+      this.isReconnecting = true;
       this.ws = new WebSocket(this.url);
       
       this.ws.onopen = () => {
         console.log('WebSocket connected');
+        this.isReconnecting = false;
         this.reconnectAttempts = 0;
         this.reconnectDelay = 1000;
         this.connectionHandlers.forEach(handler => handler());
+        this.startSyncVerification();
       };
 
       this.ws.onclose = () => {
         console.log('WebSocket disconnected');
         this.disconnectionHandlers.forEach(handler => handler());
+        this.clearPendingOperations('WebSocket disconnected');
+        this.stopSyncVerification();
         this.attemptReconnect();
       };
 
       this.ws.onerror = (error) => {
         console.error('WebSocket error:', error);
+        this.clearPendingOperations('WebSocket error occurred');
       };
 
-      this.ws.onmessage = (event) => {
-        try {
-          const data = JSON.parse(event.data);
-          
-          switch (data.type) {
-            case 'INIT_DATA':
-              this.currentVersion = data.version;
-              break;
-
-            case 'SYNC_SUCCESS':
-              this.currentVersion = data.payload.version;
-              this.resolvePendingOperation(data.payload.type, data);
-              break;
-
-            case 'SYNC_ERROR':
-              this.rejectPendingOperation(data.payload.error, data);
-              break;
-
-            case 'SYNC_CONFLICT':
-              this.handleConflict(data.payload);
-              break;
-
-            case 'PENDING_CHANGES':
-              this.applyPendingChanges(data.changes);
-              this.currentVersion = data.currentVersion;
-              break;
-
-            case 'CLIENT_CONNECTED':
-            case 'CLIENT_DISCONNECTED':
-              this.updateClientsList(data.clients);
-              break;
-          }
-          
-          this.messageHandlers.forEach(handler => handler(data));
-        } catch (error) {
-          console.error('Error parsing WebSocket message:', error);
-        }
-      };
+      this.ws.onmessage = this.handleMessage.bind(this);
     } catch (error) {
       console.error('Error creating WebSocket connection:', error);
+      this.isReconnecting = false;
       this.attemptReconnect();
     }
   }
 
+  private handleMessage(event: MessageEvent) {
+    try {
+      const data = JSON.parse(event.data);
+      
+      switch (data.type) {
+        case 'INIT_DATA':
+          this.currentVersion = data.version;
+          this.messageHandlers.forEach(handler => handler(data));
+          break;
+
+        case 'SYNC_SUCCESS':
+          this.currentVersion = data.payload.version;
+          this.resolvePendingOperation(data.payload.type, data);
+          this.messageHandlers.forEach(handler => handler(data));
+          break;
+
+        case 'SYNC_ERROR':
+          this.rejectPendingOperation(data.payload.error, data);
+          break;
+
+        case 'SYNC_CONFLICT':
+          this.handleConflict(data.payload);
+          break;
+
+        case 'PENDING_CHANGES':
+          this.applyPendingChanges(data.changes);
+          this.currentVersion = data.currentVersion;
+          break;
+
+        case 'CLIENT_CONNECTED':
+        case 'CLIENT_DISCONNECTED':
+          this.updateClientsList(data.clients);
+          this.messageHandlers.forEach(handler => handler(data));
+          break;
+
+        default:
+          this.messageHandlers.forEach(handler => handler(data));
+      }
+    } catch (error) {
+      console.error('Error parsing WebSocket message:', error);
+    }
+  }
+
+  private clearPendingOperations(reason: string) {
+    this.pendingOperations.forEach(({ reject, timeout }) => {
+      clearTimeout(timeout);
+      reject(new Error(reason));
+    });
+    this.pendingOperations.clear();
+  }
+
   private async handleConflict(payload: any) {
-    const { currentData, conflictingChanges } = payload;
-    console.warn('Sync conflict detected:', { currentData, conflictingChanges });
-    
-    // Notify handlers of conflict
+    console.warn('Sync conflict detected:', payload);
     this.messageHandlers.forEach(handler => handler({
       type: 'SYNC_CONFLICT',
-      payload: {
-        currentData,
-        conflictingChanges
-      }
+      payload
     }));
   }
 
@@ -116,8 +133,8 @@ class WebSocketService {
   }
 
   private attemptReconnect() {
-    if (this.reconnectAttempts >= this.maxReconnectAttempts) {
-      console.error('Max reconnection attempts reached');
+    if (this.reconnectAttempts >= this.maxReconnectAttempts || this.isReconnecting) {
+      console.error('Max reconnection attempts reached or already reconnecting');
       return;
     }
 
@@ -125,7 +142,7 @@ class WebSocketService {
     
     setTimeout(() => {
       this.reconnectAttempts++;
-      this.reconnectDelay *= 2; // Exponential backoff
+      this.reconnectDelay = Math.min(this.reconnectDelay * 2, 30000); // Cap at 30 seconds
       this.connect();
     }, this.reconnectDelay);
   }
@@ -133,15 +150,14 @@ class WebSocketService {
   private createOperationPromise(type: string): Promise<any> {
     return new Promise((resolve, reject) => {
       const operationId = `${type}_${Date.now()}`;
-      this.pendingOperations.set(operationId, { resolve, reject });
-
-      // Set timeout
-      setTimeout(() => {
+      const timeout = setTimeout(() => {
         if (this.pendingOperations.has(operationId)) {
           this.pendingOperations.delete(operationId);
-          reject(new Error('Operation timed out'));
+          reject(new Error(`Operation ${type} timed out`));
         }
       }, this.operationTimeout);
+
+      this.pendingOperations.set(operationId, { resolve, reject, timeout });
     });
   }
 
@@ -150,37 +166,51 @@ class WebSocketService {
       .find(key => key.startsWith(type));
     
     if (operationId) {
-      const { resolve } = this.pendingOperations.get(operationId)!;
+      const { resolve, timeout } = this.pendingOperations.get(operationId)!;
+      clearTimeout(timeout);
       this.pendingOperations.delete(operationId);
       resolve(data);
     }
   }
 
   private rejectPendingOperation(error: string, data: any) {
-    this.pendingOperations.forEach(({ reject }, key) => {
+    this.pendingOperations.forEach(({ reject, timeout }, key) => {
+      clearTimeout(timeout);
       this.pendingOperations.delete(key);
       reject({ error, details: data });
     });
   }
 
   public async send(data: any): Promise<any> {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-      throw new Error('WebSocket is not connected');
+    if (!this.isConnected()) {
+      await this.waitForConnection();
     }
 
     try {
-      // Add version to sync-related messages
       if (data.type === 'SYNC_REQUEST') {
         data.clientVersion = this.currentVersion;
       }
       
       const promise = this.createOperationPromise(data.type);
-      this.ws.send(JSON.stringify(data));
+      this.ws!.send(JSON.stringify(data));
       return promise;
     } catch (error) {
       console.error('Error sending WebSocket message:', error);
       throw error;
     }
+  }
+
+  private async waitForConnection(timeout = 5000): Promise<void> {
+    const startTime = Date.now();
+    
+    while (Date.now() - startTime < timeout) {
+      if (this.isConnected()) {
+        return;
+      }
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+    
+    throw new Error('Failed to establish WebSocket connection');
   }
 
   public onMessage(handler: MessageHandler) {
@@ -199,7 +229,7 @@ class WebSocketService {
   }
 
   private startSyncVerification() {
-    // Verify sync status every 30 seconds
+    this.stopSyncVerification();
     this.syncInterval = setInterval(() => {
       if (this.isConnected()) {
         this.send({
@@ -210,6 +240,13 @@ class WebSocketService {
         });
       }
     }, 30000);
+  }
+
+  private stopSyncVerification() {
+    if (this.syncInterval) {
+      clearInterval(this.syncInterval);
+      this.syncInterval = null;
+    }
   }
 
   public isConnected(): boolean {
@@ -248,10 +285,8 @@ class WebSocketService {
   }
 
   public disconnect() {
-    if (this.syncInterval) {
-      clearInterval(this.syncInterval);
-      this.syncInterval = null;
-    }
+    this.stopSyncVerification();
+    this.clearPendingOperations('WebSocket service disconnected');
     if (this.ws) {
       this.ws.close();
       this.ws = null;
